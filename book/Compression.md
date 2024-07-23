@@ -33,7 +33,6 @@ The method is actually rather simple and involves two delta encoding steps.
 - **Average Delta:** The deltas obtained from the previous step are no longer random. They will tend to cluster around the value `(MAX_UINT256 / series length)` due to the evenly randomized distribution of the original numbers. We'll refer to this as the `AVERAGE_DELTA`.
 - **Splitting Deltas:**
   - Based on the `AVERAGE_DELTA`, separate the deltas into two groups: positive deltas and negative deltas.
-  - Store the split information using a bit vector, where each bit (0 or 1) indicates whether the corresponding delta is positive or negative.
 - **Further Delta Encoding:**
   - The two groups of deltas (positive and negative) are each delta encoded again separately.
   - This second delta encoding further reduces the size, leveraging the patterns inherent in the grouped deltas.
@@ -237,127 +236,78 @@ The first step is to calculate the AVERAGE_DELTA value, which is used to determi
   (/ (apply #'+ delta-encoded-list) (length delta-encoded-list)))
 ```
 
-### Step 2: Split Deltas into Positive and Negative Lists
+### Step 2: Split Deltas into Positive and Negative Pair Lists
 
-Now we split the delta-encoded series into two separate lists, one for positive and one for negative deltas. While doing this, we record the splitting details using a vector.
+Now we split the delta-encoded series into two separate pair lists, one for positive and one for negative deltas (deltas below the AVERAGE_DELTA, there aren't any actual negative numbers).
+
+The new pair lists should contain the index of the delta in the prior delta list (not the original list) and the new delta value, which is always a positive integer and represents the distance from AVERAGE_DELTA. The negative list is for distances below the AVERAGE_DELTA, and the positive list is for distances above the AVERAGE_DELTA.
 
 ```lisp
 (defun split-deltas (delta-encoded-list average-delta)
-  "Split the delta-encoded list into positive and negative deltas, and record the split using a bit vector.
-
-  Examples:
-  ;> (split-deltas '(10 3 10 27) 12.5)
-  ;; => ((27) (10 3 10) #(1 0 0 1))
-
-  ;> (split-deltas '(10 15 25 3 50) 6)
-  ;; => ((10 15 25 50) (3) #(1 1 1 0 1))
-  "
+  "Split the delta-encoded list into positive and negative deltas based on AVERAGE_DELTA.
+  The positive list contains deltas above AVERAGE_DELTA with their positions and
+  the negative list contains deltas below AVERAGE_DELTA with their positions."
   (let ((positive-deltas '())
-        (negative-deltas '())
-        (split-vector (make-array (length delta-encoded-list) :element-type 'bit)))
+        (negative-deltas '()))
     (loop for delta in delta-encoded-list
-          for i from 0
+          for index from 0
           do (if (>= delta average-delta)
-                 (progn (setf (aref split-vector i) 1)
-                        (push delta positive-deltas))
-                 (progn (setf (aref split-vector i) 0)
-                        (push delta negative-deltas))))
-    (values (nreverse positive-deltas) (nreverse negative-deltas) split-vector)))
+                 (push (list index (- delta average-delta)) positive-deltas)
+                 (push (list index (- average-delta delta)) negative-deltas)))
+    (values (nreverse positive-deltas) (nreverse negative-deltas))))
 ```
 
-### Step 3: Further Delta Encoding
+### Step 3: Putting Together Compression Phase 2
 
-After splitting, we delta encode both the positive and negative delta lists.
-
-```lisp
-(defun further-delta-encode (deltas)
-  "Perform delta encoding on the provided list of deltas.
-
-  Example:
-  ;> (further-delta-encode '(10 3 15 27))
-  ;; => (10 -7 12 12)
-  "
-  (delta-encode deltas))
-```
-
-### Step 4: Integrate the Split Delta Encoding Steps
-
-Now we'll combine the above steps into a cohesive function for the split delta encoding process.
+Integrate the splitting into a cohesive function without unnecessary double delta encoding.
 
 ```lisp
 (defun second-phase-compression (delta-encoded-list)
-  "Perform the second phase of compression: split delta encoding.
-
-  Example:
-  ;> (multiple-value-bind (pos-deltas neg-deltas split-vector)
-  ;;       (second-phase-compression '(10 3 10 27))
-  ;;    (list pos-deltas neg-deltas split-vector))
-  ;; => ((27) (10 3 10) #(1 0 0 1))
-  "
-  (let* ((average-delta (calculate-average-delta delta-encoded-list))
-         (positive-deltas '())
-         (negative-deltas '())
-         (split-vector (make-array (length delta-encoded-list) :element-type 'bit)))
-    ;; Split the deltas
-    (multiple-value-bind (pos-deltas neg-deltas split-vec)
+  "Split and transform the delta-encoded list into positive and negative deltas, storing offsets."
+  (let ((average-delta (calculate-average-delta delta-encoded-list)))
+    (multiple-value-bind (positive-deltas negative-deltas)
         (split-deltas delta-encoded-list average-delta)
-      (setf positive-deltas pos-deltas
-            negative-deltas neg-deltas
-            split-vector split-vec))
-    ;; Further delta encode both lists
-    (let ((encoded-positive-deltas (further-delta-encode positive-deltas))
-          (encoded-negative-deltas (further-delta-encode negative-deltas)))
-      (values encoded-positive-deltas encoded-negative-deltas split-vector))))
+      (values positive-deltas negative-deltas average-delta))))
 ```
 
-### Step 5: Decompression of the Split Delta Encoding
+### Step 4: Decompression of the Split Delta Encoding
 
-For decompression, we need to reverse the split delta encoding process. This involves reconstituting the original delta list from the split deltas and then performing cumulative sums.
+Reinflate the deltas using the stored indexes and the `AVERAGE_DELTA`.
 
 ```lisp
-(defun second-phase-decompression (encoded-positive-deltas encoded-negative-deltas split-vector)
-  "Reverse the split delta encoding to produce the original delta-encoded list of numbers.
-
-  Example:
-  ;> (second-phase-decompression (list 27) (list 10 3 10) #(1 0 0 1))
-  ;; => (10 3 10 27)
-  "
-  (let ((positive-deltas (delta-decode encoded-positive-deltas))
-        (negative-deltas (delta-decode encoded-negative-deltas))
-        (original-deltas '()))
-    (loop for bit across split-vector
-          for i from 0
-          do (push (if (= bit 1)
-                       (pop positive-deltas)
-                       (pop negative-deltas))
-                   original-deltas))
-    (nreverse original-deltas)))
+(defun second-phase-decompression (positive-deltas negative-deltas average-delta)
+  "Reconstruct the original delta-encoded list using positive and negative deltas and AVERAGE_DELTA."
+  (let ((reconstructed-deltas (make-array (+ (length positive-deltas) (length negative-deltas)))))
+    ;; Insert positive deltas
+    (dolist (item positive-deltas)
+      (setf (aref reconstructed-deltas (first item)) (+ average-delta (second item))))
+    ;; Insert negative deltas
+    (dolist (item negative-deltas)
+      (setf (aref reconstructed-deltas (first item)) (- average-delta (second item))))
+    (coerce reconstructed-deltas 'list)))
 ```
 
-### Step 6: Integrating Everything into a Round-Trip Test
+### Step 5: Integrating Everything into a Round-Trip Test
 
-To ensure everything works as expected, we'll create a comprehensive function that performs both phases of compression and decompression, ensuring fidelity of the data.
+Ensure fidelity of the data through compression and decompression phases.
 
 ```lisp
 (defun full-round-trip (binary-data)
-  "Perform a full round trip of compression and decompression.
-
-  Example:
-  ;> (multiple-value-bind (original first-phase second-phase second-decoded first-decoded)
-  ;;       (full-round-trip #(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
-  ;;                           32 33 34 35 36 37 38 39 40 41 42 43 44 45))
-  ;;    (list original first-phase second-phase second-decoded first-decoded))
-  ;; => ((33582872004870743689512057470824895035 64584848121458614284642108774700913664)
-  ;;     (33582872004870743689512057470824895035 31001985655961709470996805038751582129)
-  ;;     ((31001985655961709470996805038751582129) nil #(1 0 0 1))
-  ;;     (33582872004870743689512057470824895035 31001985655961709470996805038751582129)
-  ;;     (33582872004870743689512057470824895035 64584848121458614284642108774700913664))
-  "
+  "Perform a full round trip of compression and decompression."
   (let* ((first-phase-compressed (first-phase-compression binary-data))
          (second-phase-compressed (multiple-value-list
                                    (second-phase-compression first-phase-compressed)))
-         (second-phase-decompressed (apply #'second-phase-decompression second-phase-compressed))
+         (positive-deltas (nth 0 second-phase-compressed))
+         (negative-deltas (nth 1 second-phase-compressed))
+         (average-delta (nth 2 second-phase-compressed))
+         (second-phase-decompressed
+           (second-phase-decompression positive-deltas negative-deltas average-delta))
          (first-phase-decompressed (first-phase-decompression second-phase-decompressed)))
+    (format t "~&Original: ~A~%" (extract-256bit-numbers binary-data))
+    (format t "~&First Phase Compressed: ~A~%" first-phase-compressed)
+    (format t "~&Second Phase Compressed: ~A~%" second-phase-compressed)
+    (format t "~&Second Phase Decompressed: ~A~%" second-phase-decompressed)
+    (format t "~&First Phase Decompressed: ~A~%" first-phase-decompressed)
     (values (extract-256bit-numbers binary-data)
             first-phase-compressed
             second-phase-compressed
