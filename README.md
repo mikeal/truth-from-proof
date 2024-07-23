@@ -21,6 +21,11 @@ Modern cryptography for humans & AI in distributed systems, decentralized networ
     * decrypt (key &rest args)
 * Proof of Object
   * objects (Object Identification Proofs)
+    * Identical or not Identical
+    * Included or not Included
+  * Power from Randomness (Proof of Entropy)
+    * Equanimity (Distribution of Randomness)
+    * Entropy (Randomness)
   * Seeing (Proof of Characteristics)
   * Continuity (Chaining Proofs)
     * permissions
